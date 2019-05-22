@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Data Scrub Demo Stack
+Parameters:
+  ScrubDataBucketName:
+    Type: String
+    Description: Enter S3 bucket name where you will keep your data
+    Default: CHANGE-ME-scrub-data
+  SagemakerNotebookName:
+    Type: String
+    Description: Enter Sagemaker Notebook Name
+    Default: nbChiTownScrub
+  Cloud9Name:
+    Type: String
+    Description: Cloud 9 Environment Name
+    Default: ChiTownScrubCloud9
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: S3 Settings
+        Parameters:
+          - ScrubDataBucketName
+      - Label:
+          default: Sagemaker Notebooks Settings
+        Parameters:
+          - SagemakerNotebookName
+      - Label:
+          default: Cloud9 Settings
+        Parameters:
+          - Cloud9Name
+Resources:
+  # ***** S3 Resources
+  # We'll create a bucket where we'll store all our data as we clean and process it
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref ScrubDataBucketName
+  # ***** Done S3 Resources
+
+  # ***** VPC Resources
+  # What we're automating is something similar to 
+  # https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Scenario1.html
+
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: vpc-data-scrub
+  # We'll add one subnet to our VPC and use the first availability zone within the region
+  VPCSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select 
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: vpc-data-scrub-sub1
+  # Creating an internet gateway to for the VPC and attaching it
+  myInternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref myInternetGateway
+  # Every subnet needs to be associated with a route table for determining how to route traffic for whatever resources we put 
+  # in the subnet, so we'll create one here 
+  # 0.0.0.0/0 here means route all destinations not explicitly known to the route table to the internet gateway created above
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref myInternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref VPCSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  # Creating a default security group
+  # A security group is like a firewall controlling inbound and outbound traffic.  By referencing itself here, I'm saying
+  # Allow any instance associated with this security group to communicate with each other
+  DefaultSecurity:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: scrub-data-sg
+      GroupDescription: default security group for VPC
+      VpcId: !Ref VPC
+  DefaultSecuritySelfRef:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties: 
+      Description: 'SelfRef'
+      FromPort: -1
+      GroupId: !GetAtt DefaultSecurity.GroupId
+      IpProtocol: -1
+      ToPort: -1
+     
+  # A VPC endpoint allows us to access AWS resources such as S3 directly, without having to go through the internet
+  # We're going to be accessing S3 a lot through our notebook, so this should speed things up for us
+  # Notice we're adding the endpoint to our route table as well as attaching it to our VPC, 
+  # so resources in our VPC will knoww how to get to it
+  S3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:*'
+            Resource: '*'
+      RouteTableIds:
+        - !Ref PublicRouteTable
+      ServiceName: !Join 
+        - ''
+        - - com.amazonaws.
+          - !Ref 'AWS::Region'
+          - .s3
+      VpcId: !Ref VPC
+      
+  # ***** Done VPC Resources
+  
+  # ***** Lambda Resources
+  # Create an IAM Role for our Lambda Function
+  # Lambdas by default don't have access to any resources, so we need to specify what it's allowed to do
+  # We will create an IAM role that the lambda function will assume below, and then attach a policy to it describing what it can access
+  LambdaServiceExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: lambdaScrubDataRole    
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+  # Lambda execution role must be able to create logs at a minimum, but we also want to 
+  # allow it to access our new S3 bucket
+  LambdaServiceExecutionRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: myLambdaScrubDataRolePolicy   
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:logs:'
+                - !Ref 'AWS::Region'
+                - ':'
+                - !Ref 'AWS::AccountId'
+                - ':log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action:
+              - 's3:*'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref ScrubDataBucketName
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref ScrubDataBucketName
+                  - '/*'
+      Roles:
+        - !Ref LambdaServiceExecutionRole
+  
+  # The actual Lambda function will be created in Cloud9
+
+  # ***** Done Lambda Resources
+  
+  # ***** Sagemaker (Jupyter Notebook Only) Config
+  # Create an IAM Role for our Sagemaker Notebook
+  # Just like our Lambda role above, we need to tell Sagemaker what it's allowed to do, so we'll create another IAM role for it
+  # When you policies are short and sweet, sometimes it's easier to define the policy inline, rather than separately as above
+  # Again we're allowing it to do whatever it wants in the S3 bucket we're creating
+  # Also, we want to invoke the lambda function, so we'lll add those priveledges as well
+  SagemakerServiceExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: sageMakerExecutionRole    
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+        - 
+          PolicyName: sageMakerChiTownPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref ScrubDataBucketName
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref ScrubDataBucketName
+                      - '/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListAllMyBuckets'
+                  - 'lambda:ListFunctions'
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunction'
+                Resource:
+                  - '*'
+                      
+  # Sagemaker Lifecycle Configuration (code to run when you launch your instance)
+  # By default, everytime you launch your notebook, you get a clean instance, with a variety of default managed conda environments
+  # So, you need to install whatever extra stuff you want that's not stock.  This config runs as a script on the instance as soon as it launches
+  # I'm including p7zip incase you need to deal with a variety of compression algorithms, and installing a newere version of pandas and s3fs into
+  # the conda python3 environment
+  # Sometimes, resolving the conda envrionment takes more than 5 minutes, which is the max time a startup script is allowed to run, so the nohup 
+  # command runs it in the background to avoid this issue
+  SagemakerLifecycleConfig:
+    Type: AWS::SageMaker::NotebookInstanceLifecycleConfig
+    Properties:
+      NotebookInstanceLifecycleConfigName: 'ChiTownScrubConfig'
+      OnStart:
+        - Content:
+            Fn::Base64:
+              !Sub |
+                #!/bin/bash 
+                set -e 
+                sudo yum --enablerepo=epel install -y -q p7zip p7zip-plugins 
+                su ec2-user -c "nohup /home/ec2-user/anaconda3/bin/conda install pandas=0.24.2 s3fs=0.2.0 -y -q -n python3 &"      
+                
+  # Declaring our Sagemaker Notebook configuration
+  # We don't need a huge instance to play with our data, this one is 4 vCPU's, 16 gigs RAM, and about $0.27 / hr
+  # We are attaching the lifecycle config from above and also launching the notebook inside our VPC, so we can take advantage of the
+  # S3 VPCEndpoint we're creating
+  # We're also attaching 10 gigs of storage (you can go up to 16TB), which should be plenty for our dataset
+  SagemakerNotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties: 
+      DirectInternetAccess: Enabled
+      InstanceType: 'ml.m5.xlarge'
+      LifecycleConfigName: !GetAtt SagemakerLifecycleConfig.NotebookInstanceLifecycleConfigName
+      NotebookInstanceName: !Ref SagemakerNotebookName
+      RoleArn: !GetAtt SagemakerServiceExecutionRole.Arn
+      RootAccess: Enabled
+      SecurityGroupIds:
+        - !Ref DefaultSecurity
+      SubnetId: !Ref VPCSubnet1
+      VolumeSizeInGB: 10
+      
+  # ***** Done Sagemaker Resources
+  
+  # ***** Cloud9 Resources
+  # This is where we'll build / test / deploy our lambda function
+  # We don't need a lot of resources on this machine, since our lambda function can only have 3 gigs of memory
+  # This has 2 vCPUs and 8 gigs of RAM, and is about $0.10 / hr 
+  # We're setting it to shutdown the instance if we haven't used it for 30 minutes as well
+  Cloud9Environment:
+    Type: 'AWS::Cloud9::EnvironmentEC2'
+    Properties:
+      AutomaticStopTimeMinutes: 30
+      InstanceType: m4.large
+      Name: !Ref Cloud9Name
+
+  # ***** Done Cloud9 Resources
+  
+Outputs:
+  S3DataBucket:
+    Description: S3 Bucket for our data
+    Value: !Ref S3Bucket
+  VPCID:
+    Description: VPC ID
+    Value: !Ref VPC
+  LambdaExecutionIAMRole:
+    Description: Lambda Execution IAM Role
+    Value: !Ref LambdaServiceExecutionRole
+  SagemakerExecutionRoleID:
+    Value: !Ref SagemakerServiceExecutionRole
+  SagemakerNotebookID:
+    Value: !Ref SagemakerNotebookInstance
+  SagemakerLifecycleConfig:
+    Value: !Ref SagemakerLifecycleConfig
+  Cloud9EnvironmentARN:
+    Description: Cloud 9 Environment ARN
+    Value: !GetAtt Cloud9Environment.Arn
+  Cloud9EnvironmentName:
+    Description: Cloud 9 Environment Name
+    Value: !GetAtt Cloud9Environment.Name
+
+
